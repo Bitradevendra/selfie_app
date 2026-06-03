@@ -169,15 +169,19 @@
             const [isRecording, setIsRecording] = useState(false);
             const [status, setStatus] = useState('');
             const [statusType, setStatusType] = useState('');
-            const [recordedChunks, setRecordedChunks] = useState([]);
             const [serverUrl, setServerUrl] = useState('');
+            const recordedChunksRef = useRef([]);
 
             // Get server URL
             useEffect(() => {
-                const protocol = window.location.protocol;
-                const hostname = window.location.hostname;
-                const port = window.location.port ? `:${window.location.port}` : '';
-                setServerUrl(`${protocol}//${hostname}${port}`);
+                if (window.location.protocol === 'file:') {
+                    setServerUrl('http://127.0.0.1:5000');
+                    setStatus('Opened as a file. Start the Flask server for uploads: python server.py');
+                    setStatusType('error');
+                    return;
+                }
+
+                setServerUrl(window.location.origin);
             }, []);
 
             const startCamera = async () => {
@@ -193,7 +197,7 @@
                             height: { ideal: isMobile ? 720 : 1080 },
                             frameRate: { ideal: 30, max: 60 }
                         },
-                        audio: false
+                        audio: true
                     };
 
                     // First try with ideal constraints
@@ -201,24 +205,32 @@
                     try {
                         stream = await navigator.mediaDevices.getUserMedia(constraints);
                     } catch (error) {
-                        console.log("Trying with simpler constraints...");
+                        console.log("Trying with simpler camera constraints...");
                         // If that fails, try with simpler constraints
                         try {
                             stream = await navigator.mediaDevices.getUserMedia({
                                 video: {
                                     facingMode: { exact: "user" }
                                 },
-                                audio: false
+                                audio: true
                             });
                         } catch (innerError) {
-                            // Last resort - try with environment facing mode
-                            console.log("Trying with environment facing mode...");
-                            stream = await navigator.mediaDevices.getUserMedia({
-                                video: {
-                                    facingMode: { exact: "environment" }
-                                },
-                                audio: false
-                            });
+                            try {
+                                // Last resort with microphone.
+                                console.log("Trying with environment camera...");
+                                stream = await navigator.mediaDevices.getUserMedia({
+                                    video: {
+                                        facingMode: { exact: "environment" }
+                                    },
+                                    audio: true
+                                });
+                            } catch (finalAudioError) {
+                                console.log("Trying camera without microphone...");
+                                stream = await navigator.mediaDevices.getUserMedia({
+                                    video: true,
+                                    audio: false
+                                });
+                            }
                         }
                     }
 
@@ -232,21 +244,30 @@
                         setStatusType('success');
                     }
 
-                    // Set up media recorder for audio
-                    const options = { mimeType: 'audio/webm' };
-                    const mediaRecorder = new MediaRecorder(stream, options);
+                    const preferredTypes = [
+                        'video/webm;codecs=vp8,opus',
+                        'video/webm;codecs=vp8',
+                        'video/webm'
+                    ];
+                    const supportedType = preferredTypes.find(type => MediaRecorder.isTypeSupported(type));
+                    const mediaRecorder = supportedType
+                        ? new MediaRecorder(stream, { mimeType: supportedType })
+                        : new MediaRecorder(stream);
                     
                     mediaRecorder.ondataavailable = (event) => {
                         if (event.data.size > 0) {
-                            setRecordedChunks(prev => [...prev, event.data]);
+                            recordedChunksRef.current.push(event.data);
                         }
                     };
                     
                     mediaRecorder.onstop = async () => {
-                        if (recordedChunks.length > 0) {
-                            const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-                            await uploadRecording(audioBlob);
-                            setRecordedChunks([]);
+                        const chunks = recordedChunksRef.current;
+                        recordedChunksRef.current = [];
+
+                        if (chunks.length > 0) {
+                            const recordingType = mediaRecorder.mimeType || 'video/webm';
+                            const recordingBlob = new Blob(chunks, { type: recordingType });
+                            await uploadRecording(recordingBlob);
                         }
                     };
                     
@@ -276,15 +297,28 @@
 
             const toggleRecording = () => {
                 if (mediaRecorderRef.current) {
-                    if (isRecording) {
+                    if (mediaRecorderRef.current.state === 'recording') {
                         mediaRecorderRef.current.stop();
                         setStatus('Recording stopped. Uploading...');
+                        setStatusType('');
+                        setIsRecording(false);
+                    } else if (mediaRecorderRef.current.state === 'inactive') {
+                        recordedChunksRef.current = [];
+                        try {
+                            mediaRecorderRef.current.start();
+                            setStatus('Recording... Speak now!');
+                            setStatusType('success');
+                            setIsRecording(true);
+                        } catch (error) {
+                            console.error('Error starting recorder:', error);
+                            setStatus(`Error starting recording: ${error.message}`);
+                            setStatusType('error');
+                            setIsRecording(false);
+                        }
                     } else {
-                        mediaRecorderRef.current.start();
-                        setStatus('Recording... Speak now!');
-                        setStatusType('success');
+                        setStatus('Recorder is still preparing. Try again in a moment.');
+                        setStatusType('error');
                     }
-                    setIsRecording(!isRecording);
                 }
             };
 
@@ -317,19 +351,20 @@
                         setStatus('Image uploaded successfully!');
                         setStatusType('success');
                     } else {
-                        throw new Error('Upload failed');
+                        const errorText = await response.text();
+                        throw new Error(errorText || 'Upload failed');
                     }
                 } catch (error) {
                     console.error('Error uploading image:', error);
-                    setStatus('Error uploading image');
+                    setStatus(`Error uploading image: ${error.message}`);
                     setStatusType('error');
                 }
             };
 
-            const uploadRecording = async (audioBlob) => {
+            const uploadRecording = async (recordingBlob) => {
                 try {
                     const formData = new FormData();
-                    formData.append('audio', audioBlob, 'recording.webm');
+                    formData.append('recording', recordingBlob, 'recording.webm');
                     
                     const response = await fetch(`${serverUrl}/upload`, {
                         method: 'POST',
@@ -340,11 +375,12 @@
                         setStatus('Recording uploaded successfully!');
                         setStatusType('success');
                     } else {
-                        throw new Error('Upload failed');
+                        const errorText = await response.text();
+                        throw new Error(errorText || 'Upload failed');
                     }
                 } catch (error) {
                     console.error('Error uploading recording:', error);
-                    setStatus('Error uploading recording');
+                    setStatus(`Error uploading recording: ${error.message}`);
                     setStatusType('error');
                 }
             };
@@ -357,8 +393,8 @@
             }, []);
 
             return h("div", { className: "container" }, [
-                h("h1", { className: "title" }, "Upload your selfie with a smile"),
-                h("div", { className: "video-container" }, 
+                h("h1", { key: "title", className: "title" }, "Upload your selfie with a smile"),
+                h("div", { key: "video", className: "video-container" }, 
                     h("video", {
                         ref: videoRef,
                         autoPlay: true,
@@ -367,29 +403,33 @@
                         className: "video"
                     })
                 ),
-                h("div", { className: "button-container" },
+                h("div", { key: "buttons", className: "button-container" },
                     !isCameraOn 
                         ? h("button", { 
+                              key: "start-camera",
                               className: "button start-button",
                               onClick: startCamera
                           }, "Start Camera")
                         : [
                               h("button", { 
+                                  key: "record",
                                   className: `button ${isRecording ? 'capture-button' : 'start-button'}`,
                                   onClick: toggleRecording
                               }, isRecording ? "Stop Recording" : "Start Recording"),
                               h("button", { 
+                                  key: "picture",
                                   className: "button start-button",
                                   onClick: captureImage
                               }, "Take Picture"),
                               h("button", { 
+                                  key: "stop-camera",
                                   className: "button",
                                   style: { background: '#6b7280' },
                                   onClick: stopCamera
                               }, "Stop Camera")
                           ]
                 ),
-                status && h("div", { className: `status ${statusType}` }, status)
+                status && h("div", { key: "status", className: `status ${statusType}` }, status)
             ]);
         }
 
